@@ -362,6 +362,8 @@ void initEditor(void) {
 ```
 So we go back there and here we can see the signal function being used to handle SIGWINCH signal.
 That signal is sent when the Window size changes and it's handled with this function.
+***IMPORTANT DISCLAIMER: `handleSigWinCh` is only called when the window size change,
+but `editorRefreshScreen()` is also called manually inside the main function***
 
 ```c
 void handleSigWinCh(int unused __attribute__((unused))) {
@@ -386,7 +388,7 @@ if (E.cy > E.screenrows) E.cy = E.screenrows - 1; E.cy --> E.cy/E.cx are the coo
 ```
 This is probably to update the cursor position based on the screen rows/cols and preventing it to go out of bounds.
 
-We now have the ***editorRefreshScreen()*** function.
+# editorRefreshScreen()
 
 ```c
 /* This function writes the whole screen using VT100 escape characters
@@ -539,7 +541,7 @@ Let's start with the code.
 int y;
     erow *r;
     char buf[32];
-    struct abuf ab = ABUF_INIT;
+    struct abuf ab = ABUF_INIT; // --> #define ABUF_INIT {NULL,0}
 
 ----------------------------- EROW STRUCTURE ------------------------------
 /* This structure represents a single line of the file we are editing. */
@@ -583,5 +585,179 @@ void abAppend(struct abuf *ab, const char *s, int len) {
     ab->len += len; // Update len and string.
 }
 ```
-Thats how the function get used.
+Let's now start with the first for loop of the function.
+
+```c
+    for (y = 0; y < E.screenrows; y++) {
+        int filerow = E.rowoff+y;
+
+        if (filerow >= E.numrows) {
+            if (E.numrows == 0 && y == E.screenrows/3) {
+                char welcome[80];
+                int welcomelen = snprintf(welcome,sizeof(welcome),
+                    "Kilo editor -- verison %s\x1b[0K\r\n", KILO_VERSION);
+                int padding = (E.screencols-welcomelen)/2;
+                if (padding) {
+                    abAppend(&ab,"~",1);
+                    padding--;
+                }
+                while(padding--) abAppend(&ab," ",1);
+                abAppend(&ab,welcome,welcomelen);
+            } else {
+                abAppend(&ab,"~\x1b[0K\r\n",7);
+            }
+            continue;
+        }
+```
+This loop is used to iteratate over screenrows, which are the rows that we can show.
+At first, ***filerow*** is set to be equal to E.rowoff + y.
+
+```c
+if (filerow >= E.numrows) {
+            if (E.numrows == 0 && y == E.screenrows/3) {
+```
+This `if (filerow >= E.numrows)` is to check if the currrent line is past the number of rows we've edited.
+
+This inner `if (E.numrows == 0 && y == E.screenrows/3)` is responsible for checking if the current number of
+edited rows is 0 and the loop is at E.screenrows/3 --> 1/3 of the screen.
+If that's the case, that's where we're gonna place our welcome message.
+
+In that case we're  printing the welcome message with snprintf.
+`\x1b[0K` is used to clear from the cursor to the end of the line.
+
+```c
+ if (E.numrows == 0 && y == E.screenrows/3) {
+                char welcome[80];
+                int welcomelen = snprintf(welcome,sizeof(welcome),
+                    "Kilo editor -- verison %s\x1b[0K\r\n", KILO_VERSION);
+                int padding = (E.screencols-welcomelen)/2;
+                if (padding) {
+                    abAppend(&ab,"~",1);
+                    padding--;
+                }
+                while(padding--) abAppend(&ab," ",1);
+                abAppend(&ab,welcome,welcomelen);
+            } else {
+                abAppend(&ab,"~\x1b[0K\r\n",7);
+            }
+```
+This is used to center the welcome text on the center of the screen and also add "~" at the start of the line.
+If we're not at the 1/3 of the screenrows we just add a '~' at the start of each line and clear the rest, from cursor position.
+
+Now going towards the second part of the loop.
+
+```c
+r = &E.row[filerow];
+
+        int len = r->rsize - E.coloff;
+        int current_color = -1;
+        if (len > 0) {
+            if (len > E.screencols) len = E.screencols;
+            char *c = r->render+E.coloff;
+            unsigned char *hl = r->hl+E.coloff;
+            int j;
+            for (j = 0; j < len; j++) {
+                if (hl[j] == HL_NONPRINT) {
+                    char sym;
+                    abAppend(&ab,"\x1b[7m",4);
+                    if (c[j] <= 26)
+                        sym = '@'+c[j];
+                    else
+                        sym = '?';
+                    abAppend(&ab,&sym,1);
+                    abAppend(&ab,"\x1b[0m",4);
+                } else if (hl[j] == HL_NORMAL) {
+                    if (current_color != -1) {
+                        abAppend(&ab,"\x1b[39m",5);
+                        current_color = -1;
+                    }
+                    abAppend(&ab,c+j,1);
+                } else {
+                    int color = editorSyntaxToColor(hl[j]);
+                    if (color != current_color) {
+                        char buf[16];
+                        int clen = snprintf(buf,sizeof(buf),"\x1b[%dm",color);
+                        current_color = color;
+                        abAppend(&ab,buf,clen);
+                    }
+                    abAppend(&ab,c+j,1);
+                }
+            }
+```
+'r' is assigned to a certain row struct at \[filerow] index.
+Rows are filled in another function that gets called before this one.
+This function in the `initEditor()` function, only gets called when the win size changes.
+So we can safely access rows at certain indexes.
+
+First `int len = r->rzize - E.coloff` is calculated.
+This calculation is needed in case we've to scroll horizontally if the line doesn't fit the screen.
+
+That's why then we can find ` if (len > E.screencols) len = E.screencols;`.
+This line of code clamps the len of the line to the screencols.
+
+Then we've these two lines.
+
+```c
+            char *c = r->render+E.coloff;
+            unsigned char *hl = r->hl+E.coloff;
+```
+
+These two are pointers. First one is gonna be the string, in which we also consider the 
+offset of columns for the same reason as before.
+
+In the follow example you can find how  r->render and r->chars works. 
+This is important to understand what we're dealing with when we 
+use render or chars string.
+
+```c
+    char *chars;        /* Row content. */
+    char *render;       /* Row content "rendered" for screen (for TABs). */
+    
+    suppose chars = "\tHello";
+    then render = "        Hello";
+    if we consider a tab 8 spaces.
+```
+
+Now, we start looping on the row content.
+
+```c
+ for (j = 0; j < len; j++)
+            {
+                if (hl[j] == HL_NONPRINT) {
+                    char sym;
+                    abAppend(&ab,"\x1b[7m",4);
+                    if (c[j] <= 26)
+                        sym = '@'+c[j];
+                    else
+                        sym = '?';
+                    abAppend(&ab,&sym,1);
+                    abAppend(&ab,"\x1b[0m",4);
+                }
+                else if (hl[j] == HL_NORMAL)
+                {
+                    if (current_color != -1)
+                    {
+                        abAppend(&ab,"\x1b[39m",5);
+                        current_color = -1;
+                    }
+                    abAppend(&ab,c+j,1);
+                }
+                else
+                {
+                    int color = editorSyntaxToColor(hl[j]);
+                    if (color != current_color)
+                    {
+                        char buf[16];
+                        int clen = snprintf(buf,sizeof(buf),"\x1b[%dm",color);
+                        current_color = color;
+                        abAppend(&ab,buf,clen);
+                    }
+                    abAppend(&ab,c+j,1);
+                }
+            }
+        }
+```
+Let's start with the first ` if (hl[j] == HL_NONPRINT) ` and check what it does.
+
+
 
