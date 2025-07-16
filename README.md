@@ -36,6 +36,8 @@ Thats what the main function looks like.
 
 Starting from the top we can see that the program accept only one argument, namely the file name. Everything's good as of now.
 
+# initEditor() function.
+
 Then ***initEditor()*** gets called.
 
 ```c
@@ -249,8 +251,337 @@ as you can also see from the previous screenshot, that basically means we've rea
 Once the end is reached, we put the good ol' '\0' and proceed to parse given string using sscanf, which will eventually store
 the results of given rows and columns inside ***"rows"*** and ***"cols"***.
 
-***A goodtakeway from that code is that we can always use functions and at the same times checks for errors.***
+***A good takeway from that code is that we can always use functions and at the same times checks for errors.***
 
+At this point we're done with the ***getCursorPosition();*** function.
 
+```c
+/* Try to get the number of columns in the current terminal. If the ioctl()
+ * call fails the function will try to query the terminal itself.
+ * Returns 0 on success, -1 on error. */
+int getWindowSize(int ifd, int ofd, int *rows, int *cols) {
+    struct winsize ws;
 
- 
+    if (ioctl(1, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
+        /* ioctl() failed. Try to query the terminal itself. */
+        int orig_row, orig_col, retval;
+
+        /* Get the initial position so we can restore it later. */
+        retval = getCursorPosition(ifd,ofd,&orig_row,&orig_col); // 
+        if (retval == -1) goto failed;
+
+        /* Go to right/bottom margin and get position. */  <----------- WE'RE HERE
+        if (write(ofd,"\x1b[999C\x1b[999B",12) != 12) goto failed;
+        retval = getCursorPosition(ifd,ofd,rows,cols);
+        if (retval == -1) goto failed;
+
+        /* Restore position. */
+        char seq[32];
+        snprintf(seq,32,"\x1b[%d;%dH",orig_row,orig_col);
+        if (write(ofd,seq,strlen(seq)) == -1) {
+            /* Can't recover... */
+        }
+        return 0;
+    } else {
+        *cols = ws.ws_col;
+        *rows = ws.ws_row;
+        return 0;
+    }
+
+failed:
+    return -1;
+}
+```
+What happens next?
+As the comment states we're going to bring the cursor on the botto/right margin.
+This can be achieved by using Ansi Escape Sequences as we did before.
+
+```c
+ if (write(ofd,"\x1b[999C\x1b[999B",12) != 12) goto failed;
+```
+In this case we have:
++ \x1b: our classic escape sequence
++ [999C -> 	moves cursor right 999 columns
++ \x1b: same as before
++ [999B -> moves cursor bottom 999 columns.
++ 12 because \x1b count as one and others are one each.
+
+That will move our cursor to the bottom right corner of our terminal.
+
+```c
+/* Go to right/bottom margin and get position. */  <----------- WE'RE HERE
+        if (write(ofd,"\x1b[999C\x1b[999B",12) != 12) goto failed;
+        retval = getCursorPosition(ifd,ofd,rows,cols);
+        if (retval == -1) goto failed;
+``` 
+Then guess what? We call the get cursor position again and store data inside rows and cols. (our parameters).
+Keep in mind that rows and cols are different from orig_rows/cols which is our starting point.
+
+```c
+ /* Restore position. */
+        char seq[32];
+        snprintf(seq,32,"\x1b[%d;%dH",orig_row,orig_col);
+        if (write(ofd,seq,strlen(seq)) == -1) {
+            /* Can't recover... */
+        }
+```
+
+Then we write restore our cursor position back to the original one.
+We use a temporary buffer, and this escape sequence. ***"\x1b[%d;%dH"*** with the previously saved orig_row and orig_col.
+We're combining both printf with ESC sequences. ***ESC[{line};{column}H*** <-- *Go to line;column #*
+If write fails we're cooked in this case. Our cursor will stay at the bottom right corner probably.
+Else we're done with this function aswell.
+I really liked the way goto were used to handle errors.
+
+```c
+void updateWindowSize(void) {
+    if (getWindowSize(STDIN_FILENO,STDOUT_FILENO,
+                      &E.screenrows,&E.screencols) == -1) {
+        perror("Unable to query the screen for size (columns / rows)");
+        exit(1);
+    }
+    E.screenrows -= 2; /* Get room for status bar. */
+}
+```
+We're back here. but there's not to much to see.
+
+```c
+void initEditor(void) {
+    E.cx = 0;
+    E.cy = 0;
+    E.rowoff = 0;
+    E.coloff = 0;
+    E.numrows = 0;
+    E.row = NULL;
+    E.dirty = 0;
+    E.filename = NULL;
+    E.syntax = NULL;
+    updateWindowSize();
+    signal(SIGWINCH, handleSigWinCh);
+}
+```
+So we go back there and here we can see the signal function being used to handle SIGWINCH signal.
+That signal is sent when the Window size changes and it's handled with this function.
+
+```c
+void handleSigWinCh(int unused __attribute__((unused))) {
+    updateWindowSize();
+    if (E.cy > E.screenrows) E.cy = E.screenrows - 1;
+    if (E.cx > E.screencols) E.cx = E.screencols - 1;
+    editorRefreshScreen();
+}
+```
+This calls the chain of function we've just seen but there's something interesting
+
+Parameters:  
+- `int __sig`
+- `__sighandler_t __handler (aka void (*)(int))`
+
+These are the function parameters. As we can see the signal function, accept a signal, and a pointer to a function that returns void and accept a "dummy int".
+But since we're not gonna use that dummy int, we can avoid get a warning from the compiler using ***int unused __attribute__((unused))***
+
+```c
+if (E.cy > E.screenrows) E.cy = E.screenrows - 1; E.cy --> E.cy/E.cx are the coordinates of the cursor.
+    if (E.cx > E.screencols) E.cx = E.screencols - 1;
+```
+This is probably to update the cursor position based on the screen rows/cols and preventing it to go out of bounds.
+
+We now have the ***editorRefreshScreen()*** function.
+
+```c
+/* This function writes the whole screen using VT100 escape characters
+ * starting from the logical state of the editor in the global state 'E'. */
+void editorRefreshScreen(void) {
+    int y;
+    erow *r;
+    char buf[32];
+    struct abuf ab = ABUF_INIT;
+
+    abAppend(&ab,"\x1b[?25l",6); /* Hide cursor. */
+    abAppend(&ab,"\x1b[H",3); /* Go home. */
+    for (y = 0; y < E.screenrows; y++) {
+        int filerow = E.rowoff+y;
+
+        if (filerow >= E.numrows) {
+            if (E.numrows == 0 && y == E.screenrows/3) {
+                char welcome[80];
+                int welcomelen = snprintf(welcome,sizeof(welcome),
+                    "Kilo editor -- verison %s\x1b[0K\r\n", KILO_VERSION);
+                int padding = (E.screencols-welcomelen)/2;
+                if (padding) {
+                    abAppend(&ab,"~",1);
+                    padding--;
+                }
+                while(padding--) abAppend(&ab," ",1);
+                abAppend(&ab,welcome,welcomelen);
+            } else {
+                abAppend(&ab,"~\x1b[0K\r\n",7);
+            }
+            continue;
+        }
+
+        r = &E.row[filerow];
+
+        int len = r->rsize - E.coloff;
+        int current_color = -1;
+        if (len > 0) {
+            if (len > E.screencols) len = E.screencols;
+            char *c = r->render+E.coloff;
+            unsigned char *hl = r->hl+E.coloff;
+            int j;
+            for (j = 0; j < len; j++) {
+                if (hl[j] == HL_NONPRINT) {
+                    char sym;
+                    abAppend(&ab,"\x1b[7m",4);
+                    if (c[j] <= 26)
+                        sym = '@'+c[j];
+                    else
+                        sym = '?';
+                    abAppend(&ab,&sym,1);
+                    abAppend(&ab,"\x1b[0m",4);
+                } else if (hl[j] == HL_NORMAL) {
+                    if (current_color != -1) {
+                        abAppend(&ab,"\x1b[39m",5);
+                        current_color = -1;
+                    }
+                    abAppend(&ab,c+j,1);
+                } else {
+                    int color = editorSyntaxToColor(hl[j]);
+                    if (color != current_color) {
+                        char buf[16];
+                        int clen = snprintf(buf,sizeof(buf),"\x1b[%dm",color);
+                        current_color = color;
+                        abAppend(&ab,buf,clen);
+                    }
+                    abAppend(&ab,c+j,1);
+                }
+            }
+        }
+        abAppend(&ab,"\x1b[39m",5);
+        abAppend(&ab,"\x1b[0K",4);
+        abAppend(&ab,"\r\n",2);
+    }
+
+    /* Create a two rows status. First row: */
+    abAppend(&ab,"\x1b[0K",4);
+    abAppend(&ab,"\x1b[7m",4);
+    char status[80], rstatus[80];
+    int len = snprintf(status, sizeof(status), "%.20s - %d lines %s",
+        E.filename, E.numrows, E.dirty ? "(modified)" : "");
+    int rlen = snprintf(rstatus, sizeof(rstatus),
+        "%d/%d",E.rowoff+E.cy+1,E.numrows);
+    if (len > E.screencols) len = E.screencols;
+    abAppend(&ab,status,len);
+    while(len < E.screencols) {
+        if (E.screencols - len == rlen) {
+            abAppend(&ab,rstatus,rlen);
+            break;
+        } else {
+            abAppend(&ab," ",1);
+            len++;
+        }
+    }
+    abAppend(&ab,"\x1b[0m\r\n",6);
+
+    /* Second row depends on E.statusmsg and the status message update time. */
+    abAppend(&ab,"\x1b[0K",4);
+    int msglen = strlen(E.statusmsg);
+    if (msglen && time(NULL)-E.statusmsg_time < 5)
+        abAppend(&ab,E.statusmsg,msglen <= E.screencols ? msglen : E.screencols);
+
+    /* Put cursor at its current position. Note that the horizontal position
+     * at which the cursor is displayed may be different compared to 'E.cx'
+     * because of TABs. */
+    int j;
+    int cx = 1;
+    int filerow = E.rowoff+E.cy;
+    erow *row = (filerow >= E.numrows) ? NULL : &E.row[filerow];
+    if (row) {
+        for (j = E.coloff; j < (E.cx+E.coloff); j++) {
+            if (j < row->size && row->chars[j] == TAB) cx += 7-((cx)%8);
+            cx++;
+        }
+    }
+    snprintf(buf,sizeof(buf),"\x1b[%d;%dH",E.cy+1,cx);
+    abAppend(&ab,buf,strlen(buf));
+    abAppend(&ab,"\x1b[?25h",6); /* Show cursor. */
+    write(STDOUT_FILENO,ab.b,ab.len);
+    abFree(&ab);
+}
+
+/* Set an editor status message for the second line of the status, at the
+ * end of the screen. */
+void editorSetStatusMessage(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap,fmt);
+    vsnprintf(E.statusmsg,sizeof(E.statusmsg),fmt,ap);
+    va_end(ap);
+    E.statusmsg_time = time(NULL);
+}
+```
+That's a big function.
+
+Let's start from the comment, 
+- '/* This function writes the whole screen using VT100 escape characters'
+- '* starting from the logical state of the editor in the global state 'E'. */' 
+
+Whats a VT100? 
+"The VT100 is a video terminal, introduced in August 1978 by Digital Equipment Corporation (DEC). It was one of the first terminals to support ANSI escape codes." as stated from Wikipedia.
+Even tho physical VT100 are no longer common, their functionality is emulated in many software applications, such as terminal emulators in operating systems like Linux. 
+
+[Here](https://espterm.github.io/docs/VT100%20escape%20codes.html) you can find a good list of VT100 escape codes.
+
+As for the second line of the comment i've yet not discovered what it means.
+
+Let's start with the code.
+
+```c
+int y;
+    erow *r;
+    char buf[32];
+    struct abuf ab = ABUF_INIT;
+
+----------------------------- EROW STRUCTURE ------------------------------
+/* This structure represents a single line of the file we are editing. */
+typedef struct erow {
+    int idx;            /* Row index in the file, zero-based. */
+    int size;           /* Size of the row, excluding the null term. */
+    int rsize;          /* Size of the rendered row. */
+    char *chars;        /* Row content. */
+    char *render;       /* Row content "rendered" for screen (for TABs). */
+    unsigned char *hl;  /* Syntax highlight type for each character in render.*/
+    int hl_oc;          /* Row had open comment at end in last syntax highlight
+                           check. */
+} erow;
+
+------------------------------ ABUF STRUCTURE ------------------------------
+/* We define a very simple "append buffer" structure, that is an heap
+ * allocated string where we can append to. This is useful in order to
+ * write all the escape sequences in a buffer and flush them to the standard
+ * output in a single call, to avoid flickering effects. */
+struct abuf {
+    char *b;
+    int len;
+};
+
+```
+So we've a pointer ***'r'*** to a struct which represents a single line of the file.
+And then we've a pointer ab to ***ABUF*** struct, which as stated from the comments,
+it is an heap allocated string (allocated with malloc) where we can happend to.
+To give you some context.
+
+```c
+  abAppend(&ab,"\x1b[?25l",6); /* Hide cursor. */
+    abAppend(&ab,"\x1b[H",3); /* Go home. */
+
+void abAppend(struct abuf *ab, const char *s, int len) { 
+    char *new = realloc(ab->b,ab->len+len); // -->  We're basically allocating spaces for previous string + len of new string.
+
+    if (new == NULL) return;
+    memcpy(new+ab->len,s,len); // Using memcpy to append to the heap allocated string the new string.
+    ab->b = new;
+    ab->len += len; // Update len and string.
+}
+```
+Thats how the function get used.
+
